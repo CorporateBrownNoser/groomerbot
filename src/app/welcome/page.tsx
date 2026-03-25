@@ -1,37 +1,109 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { motion } from "framer-motion";
-import { supabase } from "@/lib/supabase";
+import { createBrowserClient } from "@supabase/ssr";
+import { motion, AnimatePresence } from "framer-motion";
+
+function getSupabase() {
+  return createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  );
+}
 
 export default function WelcomePage() {
   const router = useRouter();
+  const supabase = getSupabase();
+
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userEmail, setUserEmail] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const [provisioning, setProvisioning] = useState(false);
   const [error, setError] = useState("");
+  const [provisionedPhone, setProvisionedPhone] = useState<string | null>(null);
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) {
+        setUserId(user.id);
+        setUserEmail(user.email || "");
+      }
+    });
+  }, [supabase.auth]);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setLoading(true);
     setError("");
 
+    if (!userId) {
+      setError("You must be signed in to complete onboarding.");
+      setLoading(false);
+      return;
+    }
+
     const form = new FormData(e.currentTarget);
 
-    const { error: dbError } = await supabase.from("clients").insert({
+    const clientData = {
+      id: userId,
       business_name: form.get("business_name") as string,
       owner_name: form.get("owner_name") as string,
       phone: form.get("phone") as string,
-      email: form.get("email") as string,
-      status: "active",
+      email: userEmail || (form.get("email") as string),
+      services_pricing: form.get("services") as string,
+      subscription_status: "active",
+    };
+
+    // Upsert client record (insert or update if already exists from Stripe webhook)
+    const { error: dbError } = await supabase.from("clients").upsert(clientData, {
+      onConflict: "id",
     });
 
     if (dbError) {
+      console.error("[Onboarding] DB error:", dbError);
       setError(dbError.message);
       setLoading(false);
       return;
     }
 
-    router.push("/dashboard");
+    console.log("[Onboarding] Client record saved, starting Vapi provisioning...");
+    setLoading(false);
+    setProvisioning(true);
+
+    // Trigger Vapi auto-provisioning
+    try {
+      const res = await fetch("/api/vapi/provision", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId: userId }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Provisioning failed");
+      }
+
+      console.log("[Onboarding] Provisioning complete:", data);
+      setProvisionedPhone(data.phoneNumber);
+
+      // Wait a moment to show the success state, then redirect
+      setTimeout(() => {
+        router.push("/dashboard");
+      }, 4000);
+    } catch (provError) {
+      console.error("[Onboarding] Provisioning error:", provError);
+      // Still redirect — they can see status on dashboard
+      setError(
+        provError instanceof Error
+          ? provError.message
+          : "AI receptionist setup encountered an issue. You can retry from the dashboard."
+      );
+      setProvisioning(false);
+      // Redirect to dashboard anyway after a delay
+      setTimeout(() => router.push("/dashboard"), 3000);
+    }
   }
 
   const inputClasses = `
@@ -41,6 +113,74 @@ export default function WelcomePage() {
     focus:border-sage/50 focus:outline-none focus:ring-2 focus:ring-sage/20
     hover:border-warm-300
   `;
+
+  // Provisioning success screen
+  if (provisionedPhone) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-cream px-6 py-16">
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95 }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ duration: 0.8, ease: [0.32, 0.72, 0, 1] }}
+          className="w-full max-w-lg text-center"
+        >
+          <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full bg-sage/10">
+            <svg
+              width="32"
+              height="32"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              className="text-sage"
+            >
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          </div>
+          <h1 className="mb-3 text-3xl font-bold tracking-tight text-warm-800">
+            Your AI Receptionist is Live!
+          </h1>
+          <p className="mb-8 text-lg text-warm-500">
+            Forward your business calls to this number and we&apos;ll handle the
+            rest.
+          </p>
+          <div className="mx-auto mb-6 rounded-2xl border border-sage/20 bg-sage/5 px-8 py-6">
+            <p className="mb-1 text-xs font-medium uppercase tracking-[0.15em] text-sage">
+              Your GroomerBot Number
+            </p>
+            <p className="text-3xl font-bold tracking-tight text-sage-dark">
+              {provisionedPhone}
+            </p>
+          </div>
+          <p className="text-sm text-warm-400">
+            Redirecting to your dashboard...
+          </p>
+        </motion.div>
+      </main>
+    );
+  }
+
+  // Provisioning in progress
+  if (provisioning) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-cream px-6 py-16">
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="flex flex-col items-center gap-4 text-center"
+        >
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-warm-300 border-t-sage" />
+          <h2 className="text-xl font-semibold text-warm-800">
+            Setting up your AI receptionist...
+          </h2>
+          <p className="max-w-sm text-sm text-warm-400">
+            We&apos;re creating a custom voice assistant trained on your services
+            and provisioning a phone number. This takes about 10 seconds.
+          </p>
+        </motion.div>
+      </main>
+    );
+  }
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-cream px-6 py-16">
@@ -138,6 +278,7 @@ export default function WelcomePage() {
                 id="email"
                 name="email"
                 type="email"
+                defaultValue={userEmail}
                 placeholder="jane@pawsandclaws.com"
                 required
                 className={inputClasses}
@@ -159,19 +300,27 @@ export default function WelcomePage() {
               placeholder={
                 "Bath & Brush — $45\nFull Groom (small) — $65\nFull Groom (large) — $85\nNail Trim — $15"
               }
+              required
               className={`${inputClasses} resize-none`}
             />
             <p className="text-xs text-warm-400">
-              List each service on a new line. This helps your AI answer pricing
-              questions accurately.
+              List each service on a new line. This is what your AI receptionist
+              will quote to callers — be specific!
             </p>
           </div>
 
-          {error && (
-            <div className="rounded-xl border border-terracotta/20 bg-terracotta/5 px-4 py-3 text-sm text-terracotta">
-              {error}
-            </div>
-          )}
+          <AnimatePresence>
+            {error && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="rounded-xl border border-terracotta/20 bg-terracotta/5 px-4 py-3 text-sm text-terracotta"
+              >
+                {error}
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           <button
             type="submit"
@@ -188,25 +337,13 @@ export default function WelcomePage() {
             {loading ? (
               <>
                 <div className="h-4 w-4 animate-spin rounded-full border-2 border-cream/30 border-t-cream" />
-                Setting up...
+                Saving...
               </>
             ) : (
               <>
                 Set Up My AI Receptionist
-                <span
-                  className="
-                    flex h-7 w-7 items-center justify-center
-                    rounded-full bg-cream/10
-                    transition-transform duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]
-                    group-hover:translate-x-0.5 group-hover:-translate-y-0.5
-                  "
-                >
-                  <svg
-                    width="12"
-                    height="12"
-                    viewBox="0 0 14 14"
-                    fill="none"
-                  >
+                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-cream/10 transition-transform duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] group-hover:translate-x-0.5 group-hover:-translate-y-0.5">
+                  <svg width="12" height="12" viewBox="0 0 14 14" fill="none">
                     <path
                       d="M1 13L13 1M13 1H5M13 1V9"
                       stroke="currentColor"
